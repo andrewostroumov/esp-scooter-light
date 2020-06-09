@@ -1,0 +1,1 @@
+idf_component_register(SRCS "holo.c" INCLUDE_DIRS "." REQUIRES "json" "nvs_flash")

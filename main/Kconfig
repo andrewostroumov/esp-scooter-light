@@ -1,0 +1,31 @@
+menu "Configuration"
+	config WIFI_SSID
+		string "WIFI SSID"
+		help
+			Enter the wifi network SSID
+	config WIFI_PASSWORD
+		string "WIFI PASSWORD"
+		help
+			Enter the wifi network PASSWORD
+    config HTTP_PROTO
+        string "HTTP PROTO"
+        help
+            Server protocol
+    config HTTP_HOST
+        string "HTTP HOST"
+        help
+            Server host
+    config HTTP_PORT
+        int "HTTP PORT"
+        default 3000
+        help
+            Server port
+	config HTTP_USERNAME
+	    string "HTTP USERNAME"
+	    help
+	        Basic AUTH username
+	config HTTP_PASSWORD
+	    string "HTTP PASSWORD"
+	    help
+	        Basic AUTH password
+endmenu
