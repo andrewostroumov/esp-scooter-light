@@ -6,6 +6,7 @@
 #include <driver/ledc.h>
 #include <cJSON.h>
 #include <esp_log.h>
+#include "string.h"
 
 #include "nvs_flash.h"
 #include "esp_system.h"
@@ -21,7 +22,7 @@ ledc_timer_config_t ledc_timer = {
         .duty_resolution = LEDC_TIMER_8_BIT,
         .freq_hz = LEDC_FREQ_HZ,
         .speed_mode = LEDC_HIGH_SPEED_MODE,
-        .timer_num = LEDC_TIMER_0,
+        .timer_num = LEDC_TIMER_1,
         .clk_cfg = LEDC_AUTO_CLK,
 };
 
@@ -30,7 +31,7 @@ ledc_channel_config_t ledc_red_channel = {
         .duty       = 0,
         .speed_mode = LEDC_HIGH_SPEED_MODE,
         .hpoint     = 0,
-        .timer_sel  = LEDC_TIMER_0,
+        .timer_sel  = LEDC_TIMER_1,
         .intr_type  = LEDC_INTR_FADE_END
 };
 
@@ -39,7 +40,7 @@ ledc_channel_config_t ledc_green_channel = {
         .duty       = 0,
         .speed_mode = LEDC_HIGH_SPEED_MODE,
         .hpoint     = 0,
-        .timer_sel  = LEDC_TIMER_0,
+        .timer_sel  = LEDC_TIMER_1,
         .intr_type  = LEDC_INTR_FADE_END
 };
 
@@ -48,7 +49,7 @@ ledc_channel_config_t ledc_blue_channel = {
         .duty       = 0,
         .speed_mode = LEDC_HIGH_SPEED_MODE,
         .hpoint     = 0,
-        .timer_sel  = LEDC_TIMER_0,
+        .timer_sel  = LEDC_TIMER_1,
         .intr_type  = LEDC_INTR_FADE_END
 };
 
@@ -127,8 +128,8 @@ holo_err_t holo_config(holo_handle_t *holo_handle) {
     return HOLO_OK;
 }
 
-holo_err_t holo_load(holo_handle_t *holo_handle, const char * default_effects) {
-    char * effects;
+holo_err_t holo_load(holo_handle_t *holo_handle, const char *default_effects) {
+    char *effects;
     uint8_t *data;
     holo_err_t err;
     nvs_handle_t nvs;
@@ -154,11 +155,21 @@ holo_err_t holo_load(holo_handle_t *holo_handle, const char * default_effects) {
     return err;
 }
 
-// TODO: required holo serialize
-holo_err_t holo_save(holo_handle_t *holo_handle) {
+holo_err_t holo_save(holo_handle_t *holo_handle, char *data) {
+    holo_err_t err;
+    nvs_handle_t nvs;
+
+    err = nvs_open(holo_handle->namespace, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) return err;
+
+    err = nvs_set_blob(nvs, holo_handle->key, data, strlen(data));
+    if (err != ESP_OK) return err;
+
+    nvs_close(nvs);
     return HOLO_OK;
 }
 
+// NOTE: event is enum
 void holo_action(holo_handle_t *holo_handle, int event) {
     if (event) {
         holo_handle->power = false;
@@ -244,7 +255,14 @@ holo_err_t holo_deserialize(holo_handle_t *holo_handle, char *json) {
     cJSON *app = cJSON_GetObjectItem(root, "application");
     cJSON *version = cJSON_GetObjectItem(root, "version");
 
+    if (holo_handle->version && version) {
+        if (strcmp(holo_handle->version, version->valuestring)) {
+            return HOLO_DESERIALIZE_REJECT;
+        }
+    }
+
     if (app && version) {
+        holo_handle->version = version->valuestring;
         ESP_LOGI(LOG_TAG, "Deserialize application %s with version %s", app->valuestring, version->valuestring);
     }
 

@@ -19,11 +19,12 @@
 #include "nvs_flash.h"
 #include "math.h"
 #include "holo.h"
+#include "light.h"
 #include "http.h"
 
-#define LOG_TAG        "light"
+#define LOG_TAG  "root"
 
-#define GPIO_WHITE_IO  GPIO_NUM_22
+#define GPIO_LIGHT_IO  GPIO_NUM_22
 #define GPIO_RED_IO    GPIO_NUM_17
 #define GPIO_GREEN_IO  GPIO_NUM_18
 #define GPIO_BLUE_IO   GPIO_NUM_19
@@ -46,11 +47,6 @@ typedef enum {
     EVENT_LONG_CLICK
 } esp_event_t;
 
-typedef struct {
-    bool power;
-    int led;
-} esp_state_t;
-
 extern const uint8_t ca_cert_pem_start[] asm("_binary_ca_crt_start");
 extern const uint8_t ca_cert_pem_end[] asm("_binary_ca_crt_end");
 
@@ -64,11 +60,10 @@ static const int CONNECTED_BIT = BIT0;
 //static const int SHUTDOWN_BIT = BIT0;
 //static const int CANCEL_BIT = BIT1;
 
-
-//esp_state_t esp_state = {
-//        .power = false,
-//        .led   = 0,
-//};
+light_handle_t light_handle = {
+        .delay = 50,
+        .pin = GPIO_LIGHT_IO,
+};
 
 holo_handle_t holo_handle = {
         .namespace = "store",
@@ -92,54 +87,6 @@ http_handle_t http_handle = {
 //    xEventGroupSetBitsFromISR(event_group, CONNECTED_BIT, NULL);
 //}
 
-//void update_state(esp_state_t *local_state, esp_event_t event) {
-//    switch (event) {
-//        case EVENT_CLICK:
-//            if (!local_state->power) {
-//                local_state->power = true;
-//                local_state->led = LED_MAX_DUTY / 2;
-//                break;
-//            }
-//
-//            if (local_state->led + LED_MAX_DUTY / 4 > LED_MAX_DUTY) {
-//                local_state->led = LED_MAX_DUTY / 4;
-//            } else {
-//                local_state->led += LED_MAX_DUTY / 4;
-//            }
-//
-//            break;
-//        case EVENT_LONG_CLICK:
-//            local_state->power = false;
-//            local_state->led = 0;
-//            break;
-//    }
-//}
-
-//void apply_state(esp_state_t *local_state) {
-//    if (!local_state->power) {
-//
-//#ifdef LED_USE_FADE
-//        ledc_set_fade_with_time(ledc_led_channel.speed_mode, ledc_led_channel.channel, 0, LED_FADE_MS);
-//        ledc_fade_start(ledc_led_channel.speed_mode, ledc_led_channel.channel, LEDC_FADE_NO_WAIT);
-//#else
-//        ledc_set_duty(ledc_led_channel.speed_mode, ledc_led_channel.channel, 0);
-//        ledc_update_duty(ledc_led_channel.speed_mode, ledc_led_channel.channel);
-//#endif
-//
-//        vTaskDelay(LED_FADE_MS / portTICK_PERIOD_MS);
-//        return;
-//    }
-//
-//#ifdef LED_USE_FADE
-//    ledc_set_fade_with_time(ledc_led_channel.speed_mode, ledc_led_channel.channel, local_state->led, LED_FADE_MS);
-//    ledc_fade_start(ledc_led_channel.speed_mode, ledc_led_channel.channel, LEDC_FADE_NO_WAIT);
-//#else
-//    ledc_set_duty(ledc_led_channel.speed_mode, ledc_led_channel.channel, local_state->led);
-//    ledc_update_duty(ledc_led_channel.speed_mode, ledc_led_channel.channel);
-//#endif
-//
-//    vTaskDelay(LED_FADE_MS / portTICK_PERIOD_MS);
-//}
 
 //void task_input_receive(void *param) {
 //    bool pressed = false;
@@ -241,6 +188,45 @@ void task_event_led_receive(void *args) {
     }
 }
 
+void task_light_live(void *args) {
+    TickType_t last_tick = 0;
+    TickType_t tick = 0;
+    TickType_t tick_shift = 0;
+    EventGroupHandle_t event_group = (EventGroupHandle_t) args;
+
+    while (true) {
+        light_live:
+        xEventGroupWaitBits(event_group, CONNECTED_BIT, true, true, portMAX_DELAY);
+
+        if (light_handle.mood != LIGHT_MOOD_BLINK) {
+            light_apply(&light_handle);
+            continue;
+        }
+
+        last_tick = xTaskGetTickCount();
+
+        while (true) {
+            light_apply(&light_handle);
+            light_blink_action(&light_handle);
+
+            while (true) {
+                vTaskDelay(INPUT_DELAY / portTICK_RATE_MS);
+
+                tick = xTaskGetTickCount();
+                tick_shift = (tick - last_tick) * portTICK_RATE_MS;
+
+                if (tick_shift >= light_handle.delay) {
+                    break;
+                }
+
+                if (light_handle.mood != LIGHT_MOOD_BLINK || !light_handle.power) {
+                    goto light_live;
+                }
+            }
+        }
+    }
+}
+
 void task_holo_live(void *args) {
     TickType_t last_tick = 0;
     TickType_t tick = 0;
@@ -285,6 +271,7 @@ void task_holo_live(void *args) {
 }
 
 void task_http_poll(void *args) {
+    holo_err_t err;
     EventGroupHandle_t event_group = (EventGroupHandle_t) args;
 
     while (true) {
@@ -297,7 +284,11 @@ void task_http_poll(void *args) {
 
         ESP_LOGI(LOG_TAG, "Response (%d) %s", http_response.data_len, http_response.data);
 
-        holo_deserialize(&holo_handle, (char *) http_response.data);
+        err = holo_deserialize(&holo_handle, (char *) http_response.data);
+        if (!err) {
+            holo_save(&holo_handle, (char *) http_response.data);
+        }
+
         http_response_cleanup(&http_handle, &http_response);
         vTaskDelay(30000 / portTICK_PERIOD_MS);
     }
@@ -400,8 +391,12 @@ void app_main(void) {
         ESP_LOGE(LOG_TAG, "Holo initialize error %d", holo_err);
     }
 
-    http_init(&http_handle);
+    esp_err_t esp_err = light_init(&light_handle);
+    if (esp_err) {
+        ESP_LOGE(LOG_TAG, "Light initialize error %d", esp_err);
+    }
 
+    http_init(&http_handle);
 
 //    gpio_config_t io_conf;
 //    io_conf.intr_type = GPIO_INTR_ANYEDGE;
@@ -422,6 +417,7 @@ void app_main(void) {
     wifi_init_sta();
 
     esp_holo_live = xEventGroupCreate();
+    esp_light_live = xEventGroupCreate();
     http_event_group = xEventGroupCreate();
 
     // TODO: whenever we success deserialize json - persist it (holo_save)
@@ -430,6 +426,7 @@ void app_main(void) {
     xEventGroupSetBits(http_event_group, CONNECTED_BIT);
 
     xTaskCreate(task_holo_live, "task_holo_live", 4096, (void *) esp_holo_live, 0, NULL);
+    xTaskCreate(task_light_live, "task_light_live", 4096, (void *) esp_light_live, 0, NULL);
     xTaskCreate(task_http_poll, "task_http_poll", 4096, (void *) http_event_group, 0, NULL);
 
 //    int i = 0;

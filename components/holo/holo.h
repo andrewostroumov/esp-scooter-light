@@ -1,6 +1,7 @@
 typedef enum {
     HOLO_OK,
     HOLO_DESERIALIZE_ERROR,
+    HOLO_DESERIALIZE_REJECT
 } holo_err_t;
 
 typedef struct {
@@ -20,6 +21,7 @@ typedef struct {
 } holo_effect_t;
 
 typedef struct {
+    char *version;
     char *namespace;
     char *key;
     bool power;
@@ -39,6 +41,8 @@ holo_err_t holo_load_default_effects(holo_handle_t *holo_handle);
 holo_err_t holo_config(holo_handle_t *holo_handle);
 
 holo_err_t holo_load(holo_handle_t *holo_handle, const char *default_effects);
+
+holo_err_t holo_save(holo_handle_t *holo_handle, char *default_effects);
 
 void holo_action(holo_handle_t *holo_handle, int event);
 
