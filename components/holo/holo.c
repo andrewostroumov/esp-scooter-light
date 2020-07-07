@@ -18,7 +18,7 @@
 
 static const double max_brightness = 255;
 
-ledc_timer_config_t ledc_timer = {
+static ledc_timer_config_t ledc_timer = {
         .duty_resolution = LEDC_TIMER_8_BIT,
         .freq_hz = LEDC_FREQ_HZ,
         .speed_mode = LEDC_HIGH_SPEED_MODE,
@@ -141,14 +141,16 @@ holo_err_t holo_load(holo_handle_t *holo_handle, const char *default_effects) {
     err = nvs_get_blob(nvs, holo_handle->key, NULL, &required_size);
     if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) return err;
 
-    if (required_size) {
-        data = malloc(required_size * sizeof(uint8_t));
-        err = nvs_get_blob(nvs, holo_handle->key, data, &required_size);
-        if (err != ESP_OK) return err;
-        effects = (char *) data;
-    } else {
-        effects = (char *) default_effects;
-    }
+//    if (required_size) {
+//        data = malloc(required_size * sizeof(uint8_t));
+//        err = nvs_get_blob(nvs, holo_handle->key, data, &required_size);
+//        if (err != ESP_OK) return err;
+//        effects = (char *) data;
+//    } else {
+//        effects = (char *) default_effects;
+//    }
+
+    effects = (char *) default_effects;
 
     err = holo_deserialize(holo_handle, effects);
     nvs_close(nvs);
@@ -192,6 +194,11 @@ void holo_action(holo_handle_t *holo_handle, int event) {
 void holo_state_increment(holo_handle_t *holo_handle) {
     if (!holo_handle->effects) { return; }
     holo_effect_t *holo_effect = &holo_handle->effects[holo_handle->eid];
+
+    if (holo_effect->bits) {
+        return;
+    }
+
     holo_handle->sid = (holo_handle->sid + 1) % holo_effect->states_length;
 }
 
@@ -199,8 +206,46 @@ holo_state_t *holo_get_state(holo_handle_t *holo_handle) {
     if (!holo_handle->effects) { return NULL; }
     holo_effect_t *holo_effect = &holo_handle->effects[holo_handle->eid];
 
+    if (holo_effect->bits & HOLO_BIT_RAND) {
+        return holo_rand_state(holo_handle);
+    }
+
     if (!holo_effect->states) { return NULL; }
     return &holo_effect->states[holo_handle->sid];
+}
+
+holo_state_t *holo_rand_state(holo_handle_t *holo_handle) {
+    holo_state_t *holo_state = malloc(sizeof(holo_state_t));
+    holo_state->fade = 300;
+    holo_state->delay = 200;
+    holo_state->brightness = 255;
+
+    uint8_t *data = malloc(sizeof(uint8_t));
+
+    esp_fill_random((void *) data, 1);
+    holo_state->red = *data;
+
+    esp_fill_random((void *) data, 1);
+    holo_state->green = *data;
+
+    esp_fill_random((void *) data, 1);
+    holo_state->blue = *data;
+
+    free(data);
+
+    return holo_state;
+}
+
+void holo_free_state(holo_handle_t *holo_handle, holo_state_t *holo_state) {
+    if (!holo_state) {
+        return;
+    }
+
+    if (!holo_state->bits) {
+        return;
+    }
+
+    free(holo_state);
 }
 
 holo_err_t holo_state_apply(holo_handle_t *holo_handle, holo_state_t *holo_state) {
@@ -232,6 +277,7 @@ holo_err_t holo_state_apply(holo_handle_t *holo_handle, holo_state_t *holo_state
             ledc_fade_start(ledc_red_channel.speed_mode, ledc_red_channel.channel, LEDC_FADE_NO_WAIT);
             ledc_fade_start(ledc_green_channel.speed_mode, ledc_green_channel.channel, LEDC_FADE_NO_WAIT);
             ledc_fade_start(ledc_blue_channel.speed_mode, ledc_blue_channel.channel, LEDC_FADE_NO_WAIT);
+            vTaskDelay(DEFAULT_FADE_MS / portTICK_PERIOD_MS);
         } else {
             ledc_set_duty(ledc_red_channel.speed_mode, ledc_red_channel.channel, (int) (holo_state->red * c));
             ledc_set_duty(ledc_green_channel.speed_mode, ledc_green_channel.channel, (int) (holo_state->green * c));
@@ -256,7 +302,8 @@ holo_err_t holo_deserialize(holo_handle_t *holo_handle, char *json) {
     cJSON *version = cJSON_GetObjectItem(root, "version");
 
     if (holo_handle->version && version) {
-        if (strcmp(holo_handle->version, version->valuestring)) {
+        if (!strcmp(holo_handle->version, version->valuestring)) {
+            ESP_LOGI(LOG_TAG, "Version %s in memory", version->valuestring);
             return HOLO_DESERIALIZE_REJECT;
         }
     }
@@ -321,6 +368,8 @@ holo_err_t holo_deserialize(holo_handle_t *holo_handle, char *json) {
             cJSON *brightness = cJSON_GetObjectItem(state, "brightness");
             cJSON *fade = cJSON_GetObjectItem(state, "fade");
             cJSON *delay = cJSON_GetObjectItem(state, "delay");
+
+            holo_state.bits = holo_effect.bits;
 
             if (red && cJSON_IsNumber(red)) {
                 holo_state.red = red->valueint;

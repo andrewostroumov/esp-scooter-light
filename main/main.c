@@ -24,20 +24,18 @@
 
 #define LOG_TAG  "root"
 
-#define GPIO_LIGHT_IO  GPIO_NUM_22
-#define GPIO_RED_IO    GPIO_NUM_17
-#define GPIO_GREEN_IO  GPIO_NUM_18
-#define GPIO_BLUE_IO   GPIO_NUM_19
+#define GPIO_LIGHT_IO       GPIO_NUM_23
+#define GPIO_HOLO_RED_IO    GPIO_NUM_16
+#define GPIO_HOLO_GREEN_IO  GPIO_NUM_17
+#define GPIO_HOLO_BLUE_IO   GPIO_NUM_18
 
 
-#define GPIO_INPUT_IO  14
-#define GPIO_INPUT_SEL 1ULL << GPIO_INPUT_IO
+#define GPIO_LIGHT_INPUT_IO  14
+#define GPIO_HOLO_INPUT_IO  14
+#define GPIO_INPUT_SEL 1ULL << (GPIO_LIGHT_INPUT_IO | GPIO_HOLO_INPUT_IO)
 
-#define LED_USE_FADE
-#define LED_FADE_MS     500
-#define LED_MAX_DUTY    256
 
-#define INPUT_DELAY     50
+#define INPUT_DELAY     10
 #define INPUT_THRESHOLD 1000
 
 #define EVENT_QUEUE_SIZE 32
@@ -54,7 +52,7 @@ extern const uint8_t default_effects_start[] asm("_binary_effects_json_start");
 extern const uint8_t default_effects_end[] asm("_binary_effects_json_start");
 
 static QueueHandle_t esp_light_queue, esp_holo_queue;
-static EventGroupHandle_t esp_input, esp_shutdown, esp_light_live, esp_holo_live, wifi_event_group, http_event_group;
+static EventGroupHandle_t esp_input_light, esp_input_holo, esp_shutdown, esp_light_live, esp_holo_live, wifi_event_group, http_event_group;
 
 static const int CONNECTED_BIT = BIT0;
 //static const int SHUTDOWN_BIT = BIT0;
@@ -68,9 +66,9 @@ light_handle_t light_handle = {
 holo_handle_t holo_handle = {
         .namespace = "store",
         .key = "holo",
-        .red_pin = GPIO_RED_IO,
-        .green_pin = GPIO_GREEN_IO,
-        .blue_pin = GPIO_BLUE_IO,
+        .red_pin = GPIO_HOLO_RED_IO,
+        .green_pin = GPIO_HOLO_GREEN_IO,
+        .blue_pin = GPIO_HOLO_BLUE_IO,
 };
 
 http_handle_t http_handle = {
@@ -81,11 +79,16 @@ http_handle_t http_handle = {
         .password = CONFIG_HTTP_PASSWORD,
         .cert = (char *) ca_cert_pem_start,
 };
-//
-//static void IRAM_ATTR gpio_input_handler(void *args) {
-//    EventGroupHandle_t event_group = (EventGroupHandle_t) args;
-//    xEventGroupSetBitsFromISR(event_group, CONNECTED_BIT, NULL);
-//}
+
+static void IRAM_ATTR gpio_input_light_handler(void *args) {
+    EventGroupHandle_t event_group = (EventGroupHandle_t) args;
+    xEventGroupSetBitsFromISR(event_group, CONNECTED_BIT, NULL);
+}
+
+static void IRAM_ATTR gpio_input_holo_handler(void *args) {
+    EventGroupHandle_t event_group = (EventGroupHandle_t) args;
+    xEventGroupSetBitsFromISR(event_group, CONNECTED_BIT, NULL);
+}
 
 
 //void task_input_receive(void *param) {
@@ -164,25 +167,24 @@ http_handle_t http_handle = {
 //    }
 //}
 
-//void task_event_light_receive(void *args) {
-//    QueueHandle_t queue = (QueueHandle_t) args;
-//    esp_event_t esp_event;
-//
-//    while (true) {
-//        xQueueReceive(queue, &esp_event, portMAX_DELAY);
-//        update_state(&esp_state, esp_event);
-//        apply_state(&esp_state);
-//    }
-//}
-
-// TODO: push from handler to this queue
-// TODO: run this loop
-void task_event_led_receive(void *args) {
+void task_event_light_receive(void *args) {
     QueueHandle_t queue = (QueueHandle_t) args;
     esp_event_t esp_event;
 
     while (true) {
         xQueueReceive(queue, &esp_event, portMAX_DELAY);
+        light_action(&light_handle, esp_event);
+        xEventGroupSetBits(esp_light_live, CONNECTED_BIT);
+    }
+}
+
+void task_event_holo_receive(void *args) {
+    QueueHandle_t queue = (QueueHandle_t) args;
+    esp_event_t esp_event;
+
+    while (true) {
+        xQueueReceive(queue, &esp_event, portMAX_DELAY);
+        ESP_LOGI(LOG_TAG, "Receive %d", esp_event);
         holo_action(&holo_handle, esp_event);
         xEventGroupSetBits(esp_holo_live, CONNECTED_BIT);
     }
@@ -266,6 +268,8 @@ void task_holo_live(void *args) {
                     break;
                 }
             }
+
+            holo_free_state(&holo_handle, holo_state);
         }
     }
 }
@@ -375,16 +379,37 @@ void app_main(void) {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
+    gpio_config_t io_conf;
+    io_conf.intr_type = GPIO_INTR_ANYEDGE;
+    io_conf.pin_bit_mask = GPIO_INPUT_SEL;
+    io_conf.mode = GPIO_MODE_INPUT;
+    io_conf.pull_down_en = 1;
+    gpio_config(&io_conf);
 
-//    esp_input_group = xEventGroupCreate();
-//    esp_shutdown = xEventGroupCreate();
-//
-//    esp_event_queue = xQueueCreate(EVENT_QUEUE_SIZE, sizeof(esp_event_t));
-//
-//    if (esp_event_queue == NULL) {
-//        ESP_LOGE(LOG_TAG, "Error initialize event queue");
-//        exit(ESP_FAIL);
-//    }
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(GPIO_LIGHT_INPUT_IO, gpio_input_light_handler, (void *) esp_input_light);
+    gpio_isr_handler_add(GPIO_HOLO_INPUT_IO, gpio_input_holo_handler, (void *) esp_input_holo);
+
+    esp_input_light = xEventGroupCreate();
+    esp_input_holo = xEventGroupCreate();
+
+    esp_holo_live = xEventGroupCreate();
+    esp_light_live = xEventGroupCreate();
+
+    esp_shutdown = xEventGroupCreate();
+    http_event_group = xEventGroupCreate();
+
+    xEventGroupSetBits(http_event_group, CONNECTED_BIT);
+
+    esp_light_queue = xQueueCreate(EVENT_QUEUE_SIZE, sizeof(esp_event_t));
+    esp_holo_queue = xQueueCreate(EVENT_QUEUE_SIZE, sizeof(esp_event_t));
+
+    if (!esp_light_queue || !esp_holo_queue) {
+        ESP_LOGE(LOG_TAG, "Error initialize event queues");
+        exit(ESP_FAIL);
+    }
+
+    wifi_init_sta();
 
     holo_err_t holo_err = holo_init(&holo_handle);
     if (holo_err) {
@@ -398,49 +423,30 @@ void app_main(void) {
 
     http_init(&http_handle);
 
-//    gpio_config_t io_conf;
-//    io_conf.intr_type = GPIO_INTR_ANYEDGE;
-//    io_conf.pin_bit_mask = GPIO_INPUT_SEL;
-//    io_conf.mode = GPIO_MODE_INPUT;
-//    io_conf.pull_down_en = 1;
-//    gpio_config(&io_conf);
-//
-//    gpio_install_isr_service(0);
-//    gpio_isr_handler_add(GPIO_INPUT_IO, gpio_input_handler, (void *) esp_input_group);
-//
-//    xTaskCreate(task_input_receive, "task_input_receive", 4096, NULL, 0, NULL);
-//    xTaskCreate(task_event_light_receive, "task_event_light_receive", 4096, (void *) esp_event_light_queue, 0, NULL);
-//    xTaskCreate(task_event_led_receive, "task_event_led_receive", 4096, (void *) esp_event_led_queue, 0, NULL);
-//    xTaskCreate(task_shutdown, "task_shutdown", 4096, NULL, 0, NULL);
-
-
-    wifi_init_sta();
-
-    esp_holo_live = xEventGroupCreate();
-    esp_light_live = xEventGroupCreate();
-    http_event_group = xEventGroupCreate();
-
-    // TODO: whenever we success deserialize json - persist it (holo_save)
     holo_load(&holo_handle, (const char *) default_effects_start);
 
-    xEventGroupSetBits(http_event_group, CONNECTED_BIT);
 
-    xTaskCreate(task_holo_live, "task_holo_live", 4096, (void *) esp_holo_live, 0, NULL);
+    //    xTaskCreate(task_shutdown, "task_shutdown", 4096, NULL, 0, NULL);
+    xTaskCreate(task_event_light_receive, "task_event_light_receive", 4096, (void *) esp_light_queue, 0, NULL);
+    xTaskCreate(task_event_holo_receive, "task_event_holo_receive", 4096, (void *) esp_holo_queue, 0, NULL);
     xTaskCreate(task_light_live, "task_light_live", 4096, (void *) esp_light_live, 0, NULL);
+    xTaskCreate(task_holo_live, "task_holo_live", 4096, (void *) esp_holo_live, 0, NULL);
     xTaskCreate(task_http_poll, "task_http_poll", 4096, (void *) http_event_group, 0, NULL);
 
-//    int i = 0;
-//    while (true) {
-//        i++;
-//
-//        if (i % 3 == 0) {
-//            holo_action(&holo_handle, EVENT_LONG_CLICK);
-//        } else {
-//            holo_action(&holo_handle, EVENT_CLICK);
-//        }
-//
-//        xEventGroupSetBits(esp_holo_live, CONNECTED_BIT);
-//        ESP_LOGI(LOG_TAG, "Click: power %d eid %d sid %d", holo_handle.power, holo_handle.eid, holo_handle.sid);
-//        vTaskDelay(15000 / portTICK_PERIOD_MS);
-//    }
+    esp_event_t e;
+    int i = 0;
+    while (true) {
+        i++;
+
+        if (i % 10 == 0) {
+            e = EVENT_LONG_CLICK;
+            xQueueSend(esp_holo_queue, &e, portMAX_DELAY);
+        } else {
+            e = EVENT_CLICK;
+            xQueueSend(esp_holo_queue, &e, portMAX_DELAY);
+        }
+
+        vTaskDelay(10000 / portTICK_PERIOD_MS);
+        ESP_LOGI(LOG_TAG, "Click %d mood %d power %d", e, light_handle.mood, light_handle.power);
+    }
 }

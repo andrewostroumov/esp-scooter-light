@@ -1,10 +1,16 @@
 typedef enum {
+    HOLO_BIT_NULL,
+    HOLO_BIT_RAND
+} holo_bit_t;
+
+typedef enum {
     HOLO_OK,
     HOLO_DESERIALIZE_ERROR,
     HOLO_DESERIALIZE_REJECT
 } holo_err_t;
 
 typedef struct {
+    uint32_t bits;
     uint8_t red;
     uint8_t green;
     uint8_t blue;
@@ -49,6 +55,10 @@ void holo_action(holo_handle_t *holo_handle, int event);
 void holo_state_increment(holo_handle_t *holo_handle);
 
 holo_state_t *holo_get_state(holo_handle_t *holo_handle);
+
+holo_state_t *holo_rand_state(holo_handle_t *holo_handle);
+
+void holo_free_state(holo_handle_t *holo_handle, holo_state_t *holo_state);
 
 holo_err_t holo_state_apply(holo_handle_t *holo_handle, holo_state_t *holo_state);
 
