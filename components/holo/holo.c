@@ -65,7 +65,6 @@ holo_err_t holo_init(holo_handle_t *holo_handle) {
     return HOLO_OK;
 }
 
-// TODO: load effects from store
 holo_err_t holo_load_default_effects(holo_handle_t *holo_handle) {
     holo_handle->effects_length = 2;
     holo_handle->effects = malloc(holo_handle->effects_length * sizeof(holo_effect_t));
@@ -141,16 +140,16 @@ holo_err_t holo_load(holo_handle_t *holo_handle, const char *default_effects) {
     err = nvs_get_blob(nvs, holo_handle->key, NULL, &required_size);
     if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) return err;
 
-//    if (required_size) {
-//        data = malloc(required_size * sizeof(uint8_t));
-//        err = nvs_get_blob(nvs, holo_handle->key, data, &required_size);
-//        if (err != ESP_OK) return err;
-//        effects = (char *) data;
-//    } else {
-//        effects = (char *) default_effects;
-//    }
-
-    effects = (char *) default_effects;
+    if (required_size) {
+        data = malloc(required_size * sizeof(uint8_t));
+        err = nvs_get_blob(nvs, holo_handle->key, data, &required_size);
+        if (err != ESP_OK) return err;
+        ESP_LOGI(LOG_TAG, "Load effects blob from nvs");
+        effects = (char *) data;
+    } else {
+        ESP_LOGI(LOG_TAG, "Load default effects blob");
+        effects = (char *) default_effects;
+    }
 
     err = holo_deserialize(holo_handle, effects);
     nvs_close(nvs);
@@ -171,7 +170,6 @@ holo_err_t holo_save(holo_handle_t *holo_handle, char *data) {
     return HOLO_OK;
 }
 
-// NOTE: event is enum
 void holo_action(holo_handle_t *holo_handle, int event) {
     if (event) {
         holo_handle->power = false;
@@ -216,8 +214,8 @@ holo_state_t *holo_get_state(holo_handle_t *holo_handle) {
 
 holo_state_t *holo_rand_state(holo_handle_t *holo_handle) {
     holo_state_t *holo_state = malloc(sizeof(holo_state_t));
-    holo_state->fade = 300;
-    holo_state->delay = 200;
+    holo_state->fade = 200;
+    holo_state->delay = 50;
     holo_state->brightness = 255;
 
     uint8_t *data = malloc(sizeof(uint8_t));
@@ -277,7 +275,7 @@ holo_err_t holo_state_apply(holo_handle_t *holo_handle, holo_state_t *holo_state
             ledc_fade_start(ledc_red_channel.speed_mode, ledc_red_channel.channel, LEDC_FADE_NO_WAIT);
             ledc_fade_start(ledc_green_channel.speed_mode, ledc_green_channel.channel, LEDC_FADE_NO_WAIT);
             ledc_fade_start(ledc_blue_channel.speed_mode, ledc_blue_channel.channel, LEDC_FADE_NO_WAIT);
-            vTaskDelay(DEFAULT_FADE_MS / portTICK_PERIOD_MS);
+            vTaskDelay(holo_state->fade / portTICK_PERIOD_MS);
         } else {
             ledc_set_duty(ledc_red_channel.speed_mode, ledc_red_channel.channel, (int) (holo_state->red * c));
             ledc_set_duty(ledc_green_channel.speed_mode, ledc_green_channel.channel, (int) (holo_state->green * c));
@@ -327,12 +325,14 @@ holo_err_t holo_deserialize(holo_handle_t *holo_handle, char *json) {
     holo_handle->effects_length = cJSON_GetArraySize(effects);
     holo_handle->effects = malloc(holo_handle->effects_length * sizeof(holo_effect_t));
 
-
     int effects_index = 0;
     int states_index = 0;
 
+    holo_handle->eid = effects_index;
+    holo_handle->sid = states_index;
+
     cJSON_ArrayForEach(effect, effects) {
-        holo_effect_t holo_effect = {};
+        holo_effect_t *holo_effect = holo_handle->effects + effects_index;
 
         cJSON *state;
         cJSON *states = cJSON_GetObjectItem(effect, "states");
@@ -340,27 +340,27 @@ holo_err_t holo_deserialize(holo_handle_t *holo_handle, char *json) {
         cJSON *bits = cJSON_GetObjectItem(effect, "bits");
 
         if (name && cJSON_IsString(name)) {
-            holo_effect.name = name->valuestring;
+            holo_effect->name = name->valuestring;
         }
 
         if (bits && cJSON_IsNumber(bits)) {
-            holo_effect.bits = bits->valueint;
+            holo_effect->bits = bits->valueint;
         }
 
         if (!states || !cJSON_IsArray(states)) {
-            ESP_LOGE(LOG_TAG, "Effect %s requires states array", holo_effect.name);
+            ESP_LOGE(LOG_TAG, "Effect %s requires states array", holo_effect->name);
             continue;
         }
 
-        holo_effect.states_length = cJSON_GetArraySize(states);
-        holo_effect.states = malloc(holo_effect.states_length * sizeof(holo_state_t));
+        holo_effect->states_length = cJSON_GetArraySize(states);
+        holo_effect->states = malloc(holo_effect->states_length * sizeof(holo_state_t));
 
-        ESP_LOGI(LOG_TAG, "Process effect %s bits 0x%08x state length %d", holo_effect.name, holo_effect.bits,
-                 holo_effect.states_length);
+        ESP_LOGI(LOG_TAG, "Process effect %s bits 0x%08x state length %d", holo_effect->name, holo_effect->bits,
+                 holo_effect->states_length);
 
         states_index = 0;
         cJSON_ArrayForEach(state, states) {
-            holo_state_t holo_state = {};
+            holo_state_t *holo_state = holo_effect->states + states_index;
 
             cJSON *red = cJSON_GetObjectItem(state, "red");
             cJSON *green = cJSON_GetObjectItem(state, "green");
@@ -369,39 +369,37 @@ holo_err_t holo_deserialize(holo_handle_t *holo_handle, char *json) {
             cJSON *fade = cJSON_GetObjectItem(state, "fade");
             cJSON *delay = cJSON_GetObjectItem(state, "delay");
 
-            holo_state.bits = holo_effect.bits;
+            holo_state->bits = holo_effect->bits;
 
             if (red && cJSON_IsNumber(red)) {
-                holo_state.red = red->valueint;
+                holo_state->red = red->valueint;
             }
 
             if (green && cJSON_IsNumber(green)) {
-                holo_state.green = green->valueint;
+                holo_state->green = green->valueint;
             }
 
             if (blue && cJSON_IsNumber(blue)) {
-                holo_state.blue = blue->valueint;
+                holo_state->blue = blue->valueint;
             }
 
             if (brightness && cJSON_IsNumber(brightness)) {
-                holo_state.brightness = brightness->valueint;
+                holo_state->brightness = brightness->valueint;
             }
 
             if (fade && cJSON_IsNumber(fade)) {
-                holo_state.fade = fade->valueint;
+                holo_state->fade = fade->valueint;
             }
             if (delay && cJSON_IsNumber(delay)) {
-                holo_state.delay = delay->valueint;
+                holo_state->delay = delay->valueint;
             }
 
-            ESP_LOGI(LOG_TAG, "Process state RGB (%d, %d, %d) brightness %d fade %d delay %d", holo_state.red,
-                     holo_state.green, holo_state.blue, holo_state.brightness, holo_state.fade, holo_state.delay);
+            ESP_LOGI(LOG_TAG, "Process state RGB (%d, %d, %d) brightness %d fade %d delay %d", holo_state->red,
+                     holo_state->green, holo_state->blue, holo_state->brightness, holo_state->fade, holo_state->delay);
 
-            holo_effect.states[states_index] = holo_state;
             states_index++;
         }
 
-        holo_handle->effects[effects_index] = holo_effect;
         effects_index++;
     }
 
