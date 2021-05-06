@@ -24,18 +24,17 @@
 
 #define LOG_TAG  "root"
 
-#define GPIO_LIGHT_IO       GPIO_NUM_21
-#define GPIO_HOLO_RED_IO    GPIO_NUM_18
-#define GPIO_HOLO_GREEN_IO  GPIO_NUM_19
-#define GPIO_HOLO_BLUE_IO   GPIO_NUM_17
+#define GPIO_LIGHT_IO       GPIO_NUM_12
+#define GPIO_HOLO_RED_IO    GPIO_NUM_19
+#define GPIO_HOLO_GREEN_IO  GPIO_NUM_18
+#define GPIO_HOLO_BLUE_IO   GPIO_NUM_15
 
 
 #define GPIO_LIGHT_INPUT_IO  GPIO_NUM_22
 #define GPIO_HOLO_INPUT_IO  GPIO_NUM_23
 #define GPIO_INPUT_SEL (1ULL << GPIO_LIGHT_INPUT_IO) | (1ULL << GPIO_HOLO_INPUT_IO)
 
-#define INPUT_DELAY 10
-#define DEBOUNCE_DELAY 50
+#define INPUT_DELAY 100
 #define INPUT_THRESHOLD 1000
 #define WIFI_RECONNECT_DELAY 60 * 60000
 #define EVENT_QUEUE_SIZE 32
@@ -54,7 +53,8 @@ typedef struct {
     EventGroupHandle_t event_group;
     EventGroupHandle_t cancel_group;
     QueueHandle_t queue;
-} cancel_event_queue_t;
+    gpio_num_t pin;
+} input_event_queue_t;
 
 extern const uint8_t ca_cert_pem_start[] asm("_binary_ca_crt_start");
 extern const uint8_t ca_cert_pem_end[] asm("_binary_ca_crt_end");
@@ -68,10 +68,9 @@ static EventGroupHandle_t wifi_event_group, http_event_group;
 static EventGroupHandle_t esp_light_input, esp_light_cancel, esp_light_live;
 static EventGroupHandle_t esp_holo_input, esp_holo_cancel, esp_holo_live;
 
-static cancel_event_queue_t light_input_receive_cancel_event_queue;
-static cancel_event_queue_t holo_input_receive_cancel_event_queue;
-static cancel_event_queue_t light_cancel_receive_cancel_event_queue;
-static cancel_event_queue_t holo_cancel_receive_cancel_event_queue;
+static input_event_queue_t light_input_event_queue;
+static input_event_queue_t holo_input_event_queue;
+
 static event_queue_t light_event_receive_event_queue;
 static event_queue_t holo_event_receive_event_queue;
 
@@ -112,45 +111,42 @@ static void IRAM_ATTR gpio_input_holo_handler(void *args) {
 }
 
 void task_input_receive(void *args) {
-    bool pressed = false;
+    int last_pin_level = 1;
+    int pin_level = 1;
     TickType_t last_tick = 0;
     TickType_t tick = 0;
     TickType_t tick_shift = 0;
     esp_event_t esp_event = EVENT_CLICK;
-    cancel_event_queue_t *cancel_event_queue = (cancel_event_queue_t *) args;
+    input_event_queue_t *input_event_queue = (input_event_queue_t *) args;
 
     while (true) {
-        xEventGroupWaitBits(cancel_event_queue->event_group, CONNECTED_BIT, true, true, portMAX_DELAY);
-        ESP_LOGI(LOG_TAG, "Receive with %p", cancel_event_queue);
+        xEventGroupWaitBits(input_event_queue->event_group, CONNECTED_BIT, true, true, portMAX_DELAY);
+        vTaskDelay(INPUT_DELAY / portTICK_RATE_MS);
 
+        pin_level = gpio_get_level(input_event_queue->pin);
+        ESP_LOGI(LOG_TAG, "Release input event (last_pin_level %d / pin_level %d) %p", last_pin_level, pin_level, input_event_queue);
+
+        if (pin_level == last_pin_level) {
+            ESP_LOGI(LOG_TAG, "Void current on input");
+            continue;
+        }
+
+        last_pin_level = pin_level;
         tick = xTaskGetTickCount();
-        tick_shift = (tick - last_tick) * portTICK_RATE_MS;
 
-        if (last_tick && tick_shift < DEBOUNCE_DELAY) {
-            ESP_LOGI(LOG_TAG, "Debounce - shift %d with %p", tick_shift, cancel_event_queue);
-            continue;
-        }
-
-        if (!pressed || tick_shift >= INPUT_THRESHOLD * 5) {
-            ESP_LOGI(LOG_TAG, "Click fall with %p", cancel_event_queue);
-            pressed = true;
+        if (!pin_level) {
+            xEventGroupSetBits(input_event_queue->cancel_group, CONNECTED_BIT);
             last_tick = tick;
-            xEventGroupSetBits(cancel_event_queue->cancel_group, CONNECTED_BIT);
             continue;
         }
 
-        ESP_LOGI(LOG_TAG, "Click raise with %p", cancel_event_queue);
-        last_tick = tick;
-        pressed = false;
-
-        if (tick_shift >= INPUT_THRESHOLD) {
-            ESP_LOGI(LOG_TAG, "Shutdown - shift %d with %p", tick_shift, cancel_event_queue);
+        tick_shift = (tick - last_tick) * portTICK_RATE_MS;
+        if (last_tick && tick_shift < INPUT_THRESHOLD) {
+            xEventGroupSetBits(input_event_queue->cancel_group, CANCEL_BIT);
+            xQueueSend(input_event_queue->queue, &esp_event, portMAX_DELAY);
+            ESP_LOGI(LOG_TAG, "Send click (shift %d) with %p", tick_shift, input_event_queue);
             continue;
         }
-
-        xEventGroupSetBits(cancel_event_queue->cancel_group, CANCEL_BIT);
-        ESP_LOGI(LOG_TAG, "Send with %p", cancel_event_queue);
-        xQueueSend(cancel_event_queue->queue, &esp_event, portMAX_DELAY);
     }
 }
 
@@ -160,10 +156,10 @@ void task_cancel_receive(void *args) {
     TickType_t tick_shift = 0;
     EventBits_t xEventBits;
     esp_event_t esp_event = EVENT_LONG_CLICK;
-    cancel_event_queue_t *cancel_event_queue = (cancel_event_queue_t *) args;
+    input_event_queue_t *input_event_queue = (input_event_queue_t *) args;
 
     while (true) {
-        xEventGroupWaitBits(cancel_event_queue->cancel_group, CONNECTED_BIT, true, true, portMAX_DELAY);
+        xEventGroupWaitBits(input_event_queue->cancel_group, CONNECTED_BIT, true, true, portMAX_DELAY);
         last_tick = xTaskGetTickCount();
 
         while (true) {
@@ -173,18 +169,19 @@ void task_cancel_receive(void *args) {
             tick_shift = (tick - last_tick) * portTICK_RATE_MS;
 
             if (tick_shift >= INPUT_THRESHOLD) {
-                xQueueSend(cancel_event_queue->queue, &esp_event, portMAX_DELAY);
+                ESP_LOGI(LOG_TAG, "Send long click (shift %d) with %p", tick_shift, input_event_queue);
+                xQueueSend(input_event_queue->queue, &esp_event, portMAX_DELAY);
                 break;
             }
 
-            xEventBits = xEventGroupGetBits(cancel_event_queue->cancel_group);
+            xEventBits = xEventGroupGetBits(input_event_queue->cancel_group);
 
             if (xEventBits == (EventBits_t) CANCEL_BIT) {
                 break;
             }
         }
 
-        xEventGroupClearBits(cancel_event_queue->cancel_group, CANCEL_BIT);
+        xEventGroupClearBits(input_event_queue->cancel_group, CANCEL_BIT);
     }
 }
 
@@ -323,7 +320,7 @@ void task_http_poll(void *args) {
 
 void task_wifi_start(void *args) {
     EventGroupHandle_t event_group = (EventGroupHandle_t) args;
-    while(true) {
+    while (true) {
         xEventGroupWaitBits(event_group, RECONNECT_BIT, true, true, portMAX_DELAY);
         vTaskDelay(WIFI_RECONNECT_DELAY / portTICK_PERIOD_MS);
         ESP_LOGI(LOG_TAG, "[WIFI] Reconnecting to %s...", CONFIG_WIFI_SSID);
@@ -458,26 +455,18 @@ void app_main(void) {
     http_init(&http_handle);
     holo_load(&holo_handle, (const char *) default_effects_start);
 
-    light_input_receive_cancel_event_queue = (cancel_event_queue_t) {
+    light_input_event_queue = (input_event_queue_t) {
             .event_group = esp_light_input,
             .cancel_group = esp_light_cancel,
-            .queue = esp_light_queue
+            .queue = esp_light_queue,
+            .pin = GPIO_LIGHT_INPUT_IO
     };
 
-    holo_input_receive_cancel_event_queue = (cancel_event_queue_t) {
+    holo_input_event_queue = (input_event_queue_t) {
             .event_group = esp_holo_input,
             .cancel_group = esp_holo_cancel,
-            .queue = esp_holo_queue
-    };
-
-    light_cancel_receive_cancel_event_queue = (cancel_event_queue_t) {
-            .cancel_group = esp_light_cancel,
-            .queue = esp_light_queue
-    };
-
-    holo_cancel_receive_cancel_event_queue = (cancel_event_queue_t) {
-            .cancel_group = esp_holo_cancel,
-            .queue = esp_holo_queue
+            .queue = esp_holo_queue,
+            .pin = GPIO_HOLO_INPUT_IO
     };
 
     light_event_receive_event_queue = (event_queue_t) {
@@ -490,14 +479,14 @@ void app_main(void) {
             .queue = esp_holo_queue
     };
 
-    ESP_LOGI(LOG_TAG, "Light pointer %p", &light_input_receive_cancel_event_queue);
-    ESP_LOGI(LOG_TAG, "Holo pointer %p", &holo_input_receive_cancel_event_queue);
+    ESP_LOGI(LOG_TAG, "Light pointer %p", &light_input_event_queue);
+    ESP_LOGI(LOG_TAG, "Holo pointer %p", &holo_input_event_queue);
 
-    xTaskCreate(task_input_receive, "task_light_input_receive", 4096, (void *) &light_input_receive_cancel_event_queue, 0, NULL);
-    xTaskCreate(task_input_receive, "task_holo_input_receive", 4096, (void *) &holo_input_receive_cancel_event_queue, 0, NULL);
+    xTaskCreate(task_input_receive, "task_light_input_receive", 4096, (void *) &light_input_event_queue, 0, NULL);
+    xTaskCreate(task_input_receive, "task_holo_input_receive", 4096, (void *) &holo_input_event_queue, 0, NULL);
 
-    xTaskCreate(task_cancel_receive, "task_light_cancel_receive", 4096, (void *) &light_cancel_receive_cancel_event_queue, 0, NULL);
-    xTaskCreate(task_cancel_receive, "task_holo_cancel_receive", 4096, (void *) &holo_cancel_receive_cancel_event_queue, 0, NULL);
+    xTaskCreate(task_cancel_receive, "task_light_cancel_receive", 4096, (void *) &light_input_event_queue, 0, NULL);
+    xTaskCreate(task_cancel_receive, "task_holo_cancel_receive", 4096, (void *) &holo_input_event_queue, 0, NULL);
 
     xTaskCreate(task_light_event_receive, "task_light_event_receive", 4096, (void *) &light_event_receive_event_queue, 0, NULL);
     xTaskCreate(task_holo_event_receive, "task_holo_event_receive", 4096, (void *) &holo_event_receive_event_queue, 0, NULL);
